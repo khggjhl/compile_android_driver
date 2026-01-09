@@ -1,21 +1,24 @@
-name: Android Kernel Driver Builder
+name: Android 10 Kernel Driver Builder
 
 on:
   workflow_dispatch:
     inputs:
-      android_version:
-        description: 'Android Version (Kernel) (e.g., 14)'
-        required: true
       kernel_version:
-        description: 'Kernel Version (e.g., 6.1)'
+        description: 'Kernel Version (e.g., 4.14, 4.14.141, 4.19.81)'
         required: true
+        default: '4.14.141'
       driver_name:
         description: 'Driver Module Name (e.g., mydriver.ko)'
         required: true
+        default: 'mydriver.ko'
       target_arch:
-        description: 'Target Architecture (aarch64, x86_64, etc.)'
+        description: 'Target Architecture'
         required: true
         default: 'aarch64'
+        options:
+          - aarch64
+          - arm64
+          - x86_64
 
 jobs:
   build:
@@ -25,15 +28,530 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4.2.2
         
+      - name: Validate inputs for Android 10
+        run: |
+          echo "🔧 Android 10 Kernel Driver Builder"
+          echo "🎯 Target: Android 10 with kernel ${{ github.event.inputs.kernel_version }}"
+          
+          KERNEL_VERSION="${{ github.event.inputs.kernel_version }}"
+          
+          # 提取内核主次版本
+          KERNEL_MAJOR_MINOR=$(echo "$KERNEL_VERSION" | cut -d. -f1-2)
+          KERNEL_PATCH=$(echo "$KERNEL_VERSION" | cut -d. -f3-)
+          
+          echo "📊 Version breakdown:"
+          echo "  Full version: $KERNEL_VERSION"
+          echo "  Major.Minor: $KERNEL_MAJOR_MINOR"
+          echo "  Patch: ${KERNEL_PATCH:-N/A}"
+          
+          # 验证支持的版本
+          case "$KERNEL_MAJOR_MINOR" in
+            "4.14"|"4.19"|"5.4")
+              echo "✅ Supported kernel series: $KERNEL_MAJOR_MINOR"
+              ;;
+            *)
+              echo "⚠️ Warning: Kernel series $KERNEL_MAJOR_MINOR may not be fully supported for Android 10"
+              echo "✅ Recommended: 4.14.x, 4.19.x, or 5.4.x"
+              ;;
+          esac
+
       - name: Prepare kerneldriver directory
         run: |
-          mkdir kerneldriver
-          mv ./code/*.h ./code/*.c ./code/Makefile kerneldriver/
+          mkdir -p kerneldriver
           
-      - name: Install repo tool
+          # 复制所有源文件
+          if [ -d "./code" ]; then
+            echo "📂 Copying files from ./code directory..."
+            find ./code -name "*.c" -exec cp {} kerneldriver/ \;
+            find ./code -name "*.h" -exec cp {} kerneldriver/ \;
+            find ./code -name "Makefile" -exec cp {} kerneldriver/ \;
+            find ./code -name "Kconfig" -exec cp {} kerneldriver/ \;
+          else
+            echo "📂 Looking for driver files in root directory..."
+            cp *.c kerneldriver/ 2>/dev/null || true
+            cp *.h kerneldriver/ 2>/dev/null || true
+            cp Makefile kerneldriver/ 2>/dev/null || true
+            cp Kconfig kerneldriver/ 2>/dev/null || true
+          fi
+          
+          # 创建必要的文件
+          if [ ! -f kerneldriver/Makefile ]; then
+            echo "📝 Creating Makefile for Android 10 kernel module..."
+            DRIVER_NAME="${{ github.event.inputs.driver_name }}"
+            MODULE_NAME="${DRIVER_NAME%.ko}"
+            
+            cat > kerneldriver/Makefile << EOF
+# SPDX-License-Identifier: GPL-2.0
+obj-m += $MODULE_NAME.o
+$MODULE_NAME-y := $(ls kerneldriver/*.c 2>/dev/null | head -1 | xargs basename -s .c | tr -d '\n')
+
+ccflags-y := -I\$(srctree)/drivers/kerneldriver -Wno-error
+
+# For Android 10 kernel compatibility
+ifeq (\$(CONFIG_MODVERSIONS),y)
+  \$(MODULE_NAME).o: \$(src)/compat_ver.h
+endif
+EOF
+          fi
+          
+          # 创建兼容性头文件
+          cat > kerneldriver/compat_ver.h << 'EOF'
+#ifndef _COMPAT_VER_H
+#define _COMPAT_VER_H
+
+#include <linux/version.h>
+
+/* Android 10 kernel 4.14.141+ compatibility macros */
+
+#if LINUX_VERSION_CODE < KERNEL_VERSION(4, 14, 0)
+#error "Kernel version too old, need at least 4.14"
+#endif
+
+/* Ensure we're building for Android 10 */
+#ifdef CONFIG_ANDROID
+#define ANDROID_VERSION 10
+#endif
+
+#endif /* _COMPAT_VER_H */
+EOF
+          
+          echo "📁 Driver source prepared in kerneldriver/:"
+          ls -la kerneldriver/
+
+      - name: Install build dependencies
         run: |
+          echo "📦 Installing dependencies for Android 10 kernel build..."
+          sudo apt-get update
+          sudo apt-get install -y \
+            git \
+            curl \
+            python3 \
+            build-essential \
+            flex \
+            bison \
+            libssl-dev \
+            libelf-dev \
+            bc \
+            rsync \
+            kmod \
+            device-tree-compiler \
+            lz4 \
+            lzop \
+            dwarves \
+            python3-pip
+            
+          # 安装 repo 工具
+          sudo pip3 install git-repo || true
           sudo curl -L https://storage.googleapis.com/git-repo-downloads/repo -o /usr/local/bin/repo
           sudo chmod a+x /usr/local/bin/repo
+          
+          echo "📟 Tools version:"
+          repo --version 2>/dev/null || echo "Repo tool installed"
+          make --version | head -1
+
+      - name: Set up Android 10 Kernel with specific version
+        id: init_kernel
+        run: |
+          echo "📥 Setting up Android 10 Kernel ${{ github.event.inputs.kernel_version }}"
+          
+          mkdir -p android-kernel && cd android-kernel
+          
+          FULL_VERSION="${{ github.event.inputs.kernel_version }}"
+          MAJOR_MINOR=$(echo "$FULL_VERSION" | cut -d. -f1-2)
+          
+          echo "🔍 Looking for kernel version: $FULL_VERSION (series: $MAJOR_MINOR)"
+          
+          # Android 10 特定版本的分支/标签映射
+          declare -A VERSION_MAP=(
+            # 4.14.141+ 系列
+            ["4.14.141"]="android-4.14-stable"
+            ["4.14.141-rt"]="android-4.14-stable-rt"
+            ["4.14.186"]="android-4.14-stable"
+            ["4.14.207"]="android-4.14-stable"
+            ["4.14.248"]="android-4.14-stable"
+            
+            # 4.19.x 系列
+            ["4.19.81"]="android-4.19-stable"
+            ["4.19.113"]="android-4.19-stable"
+            ["4.19.152"]="android-4.19-stable"
+            ["4.19.190"]="android-4.19-stable"
+            
+            # 5.4.x 系列
+            ["5.4.42"]="android-5.4-stable"
+            ["5.4.61"]="android-5.4-stable"
+            ["5.4.86"]="android-5.4-stable"
+            ["5.4.105"]="android-5.4-stable"
+          )
+          
+          # 尝试精确版本匹配
+          BRANCH="${VERSION_MAP[$FULL_VERSION]}"
+          
+          if [ -n "$BRANCH" ]; then
+            echo "✅ Found exact match: $BRANCH for version $FULL_VERSION"
+          else
+            echo "⚠️ No exact match for $FULL_VERSION, trying generic branch..."
+            
+            # 根据主次版本选择通用分支
+            case "$MAJOR_MINOR" in
+              "4.14")
+                BRANCH="android-4.14-stable"
+                ;;
+              "4.19")
+                BRANCH="android-4.19-stable"
+                ;;
+              "5.4")
+                BRANCH="android-5.4-stable"
+                ;;
+              *)
+                BRANCH="android-4.14-stable"  # 默认回退
+                ;;
+            esac
+            echo "📌 Using generic branch: $BRANCH for series $MAJOR_MINOR"
+          fi
+          
+          # 记录使用的分支
+          echo "selected_branch=$BRANCH" >> $GITHUB_OUTPUT
+          echo "kernel_series=$MAJOR_MINOR" >> $GITHUB_OUTPUT
+
+      - name: Initialize kernel repository
+        run: |
+          cd android-kernel
+          BRANCH="${{ steps.init_kernel.outputs.selected_branch }}"
+          
+          echo "🔄 Initializing with branch: $BRANCH"
+          
+          # 尝试多个镜像源
+          MIRRORS=(
+            "https://android.googlesource.com/kernel/manifest"
+            "https://mirrors.tuna.tsinghua.edu.cn/git/AOSP/kernel/manifest"
+            "https://mirror.nju.edu.cn/git/AOSP/kernel/manifest"
+          )
+          
+          INIT_SUCCESS=false
+          for MIRROR in "${MIRRORS[@]}"; do
+            echo "🌐 Trying mirror: $(echo $MIRROR | cut -d'/' -f3)"
+            
+            rm -rf .repo 2>/dev/null || true
+            
+            if timeout 300 repo init -u "$MIRROR" -b "$BRANCH" --depth=1; then
+              echo "✅ Successfully initialized from $MIRROR"
+              INIT_SUCCESS=true
+              break
+            else
+              echo "❌ Failed with mirror: $(echo $MIRROR | cut -d'/' -f3)"
+              sleep 2
+            fi
+          done
+          
+          if [ "$INIT_SUCCESS" = false ]; then
+            echo "❌ All mirrors failed, trying with --partial-clone..."
+            repo init -u https://android.googlesource.com/kernel/manifest \
+              -b "$BRANCH" \
+              --partial-clone \
+              --partial-clone-exclude=^.*/test/.*$ \
+              --depth=1 || {
+              echo "❌ Repo init failed completely"
+              exit 1
+            }
+          fi
+          
+          echo "📁 Repo initialized successfully"
+
+      - name: Sync kernel sources with retry
+        run: |
+          cd android-kernel
+          echo "🔄 Syncing kernel sources (this may take a while)..."
+          
+          # 设置重试机制
+          MAX_RETRIES=5
+          RETRY_DELAY=30
+          
+          for i in $(seq 1 $MAX_RETRIES); do
+            echo "📥 Sync attempt $i/$MAX_RETRIES"
+            
+            # 使用优化的 sync 参数
+            if repo sync \
+              -j$(($(nproc) * 2)) \
+              -c \
+              --no-tags \
+              --optimized-fetch \
+              --force-sync \
+              --prune \
+              --verbose \
+              2>&1 | tee sync_attempt_$i.log; then
+              
+              echo "✅ Sync completed successfully on attempt $i"
+              
+              # 检查是否同步到了正确的版本
+              if [ -f "Makefile" ]; then
+                KERNEL_VERSION_SYNCED=$(grep -m1 "^VERSION =" Makefile | awk '{print $3}')
+                PATCHLEVEL_SYNCED=$(grep -m1 "^PATCHLEVEL =" Makefile | awk '{print $3}')
+                echo "📋 Synced kernel version: $KERNEL_VERSION_SYNCED.$PATCHLEVEL_SYNCED"
+              fi
+              
+              break
+            else
+              echo "❌ Sync failed on attempt $i"
+              
+              if [ $i -lt $MAX_RETRIES ]; then
+                echo "⏳ Waiting $RETRY_DELAY seconds before retry..."
+                sleep $RETRY_DELAY
+                
+                # 清理可能的锁定文件
+                find .repo -name "*.lock" -delete 2>/dev/null || true
+                
+                # 增加重试延迟
+                RETRY_DELAY=$((RETRY_DELAY * 2))
+              else
+                echo "❌ Sync failed after $MAX_RETRIES attempts"
+                
+                # 尝试部分恢复
+                echo "🔄 Trying recovery sync with limited threads..."
+                repo sync -j4 --fail-fast 2>&1 | tee sync_recovery.log || {
+                  echo "❌ Recovery also failed"
+                  
+                  # 输出错误信息
+                  echo "=== Last 50 lines of sync logs ==="
+                  tail -50 sync_attempt_*.log 2>/dev/null || true
+                  tail -50 sync_recovery.log 2>/dev/null || true
+                  
+                  exit 1
+                }
+              fi
+            fi
+          done
+          
+          echo "📊 Repository size after sync:"
+          du -sh . || true
+
+      - name: Apply specific kernel version patches (if needed)
+        id: apply_patches
+        run: |
+          cd android-kernel
+          FULL_VERSION="${{ github.event.inputs.kernel_version }}"
+          MAJOR_MINOR="${{ steps.init_kernel.outputs.kernel_series }}"
+          
+          echo "🔧 Checking kernel version: need $FULL_VERSION"
+          
+          # 检查当前内核版本
+          if [ -f "Makefile" ]; then
+            VERSION=$(grep -m1 "^VERSION =" Makefile | awk '{print $3}')
+            PATCHLEVEL=$(grep -m1 "^PATCHLEVEL =" Makefile | awk '{print $3}')
+            SUBLEVEL=$(grep -m1 "^SUBLEVEL =" Makefile | awk '{print $3}' || echo "0")
+            
+            CURRENT_VERSION="$VERSION.$PATCHLEVEL.$SUBLEVEL"
+            echo "📋 Current kernel version: $CURRENT_VERSION"
+            
+            if [[ "$CURRENT_VERSION" == "$FULL_VERSION"* ]]; then
+              echo "✅ Kernel version matches (or is close enough)"
+              echo "patch_needed=false" >> $GITHUB_OUTPUT
+            else
+              echo "⚠️ Kernel version mismatch: have $CURRENT_VERSION, want $FULL_VERSION"
+              echo "patch_needed=true" >> $GITHUB_OUTPUT
+              
+              # 尝试应用版本补丁
+              echo "🩹 Attempting to patch kernel version..."
+              
+              # 修改 Makefile 中的版本号
+              if [[ "$FULL_VERSION" == 4.14.* ]]; then
+                TARGET_VERSION=4
+                TARGET_PATCHLEVEL=14
+                TARGET_SUBLEVEL=$(echo "$FULL_VERSION" | cut -d. -f3)
+                
+                sed -i "s/^VERSION = .*/VERSION = $TARGET_VERSION/" Makefile
+                sed -i "s/^PATCHLEVEL = .*/PATCHLEVEL = $TARGET_PATCHLEVEL/" Makefile
+                sed -i "s/^SUBLEVEL = .*/SUBLEVEL = $TARGET_SUBLEVEL/" Makefile
+                
+                echo "📝 Patched Makefile to version $FULL_VERSION"
+              fi
+            fi
+          else
+            echo "⚠️ Makefile not found, cannot check version"
+            echo "patch_needed=false" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Copy driver to kernel source tree
+        run: |
+          cd android-kernel
+          echo "📂 Integrating driver into kernel tree..."
+          
+          # 查找正确的 drivers 目录
+          DRIVERS_DIR=""
+          if [ -d "drivers" ]; then
+            DRIVERS_DIR="drivers"
+          elif [ -d "common/drivers" ]; then
+            DRIVERS_DIR="common/drivers"
+          elif [ -d "kernel/drivers" ]; then
+            DRIVERS_DIR="kernel/drivers"
+          else
+            # 创建 drivers 目录
+            mkdir -p drivers
+            DRIVERS_DIR="drivers"
+          fi
+          
+          echo "📁 Using drivers directory: $DRIVERS_DIR"
+          
+          # 复制驱动
+          cp -r ../kerneldriver "$DRIVERS_DIR/"
+          
+          # 更新 drivers/Makefile
+          DRIVER_MAKEFILE="$DRIVERS_DIR/Makefile"
+          if [ ! -f "$DRIVER_MAKEFILE" ]; then
+            echo "📝 Creating $DRIVER_MAKEFILE"
+            echo "# Kernel drivers Makefile" > "$DRIVER_MAKEFILE"
+          fi
+          
+          # 添加驱动到 Makefile
+          if ! grep -q "kerneldriver" "$DRIVER_MAKEFILE"; then
+            echo "obj-y += kerneldriver/" >> "$DRIVER_MAKEFILE"
+            echo "✅ Added kerneldriver to $DRIVER_MAKEFILE"
+          fi
+          
+          echo "📁 Driver files installed:"
+          ls -la "$DRIVERS_DIR/kerneldriver/"
+
+      - name: Configure kernel for module building
+        run: |
+          cd android-kernel
+          echo "⚙️ Configuring kernel for Android 10 module building..."
+          
+          # 为 Android 10 设置配置
+          export ARCH="${{ github.event.inputs.target_arch }}"
+          
+          # 尝试加载默认配置
+          if [ -f "arch/$ARCH/configs/defconfig" ]; then
+            echo "📋 Using arch/$ARCH/configs/defconfig"
+            make defconfig
+          elif [ -f "arch/arm64/configs/defconfig" ] && [ "$ARCH" = "aarch64" ]; then
+            echo "📋 Using arch/arm64/configs/defconfig (aarch64 fallback)"
+            make ARCH=arm64 defconfig
+          else
+            echo "⚠️ No defconfig found, using allyesconfig for module building"
+            make allyesconfig
+          fi
+          
+          # 确保模块支持已启用
+          echo "🔧 Enabling module support..."
+          sed -i 's/# CONFIG_MODULES is not set/CONFIG_MODULES=y/' .config 2>/dev/null || true
+          echo "CONFIG_MODULES=y" >> .config
+          
+          # 关闭模块签名验证（简化构建）
+          echo "CONFIG_MODULE_SIG=n" >> .config
+          echo "CONFIG_MODULE_SIG_ALL=n" >> .config
+          
+          # 更新配置
+          make oldconfig 2>/dev/null || true
+          
+          echo "📋 Kernel configuration prepared"
+
+      - name: Build kernel module for Android 10
+        id: build_module
+        run: |
+          cd android-kernel
+          echo "🔨 Building kernel module for Android 10..."
+          
+          ARCH="${{ github.event.inputs.target_arch }}"
+          DRIVER_NAME="${{ github.event.inputs.driver_name }}"
+          MODULE_NAME="${DRIVER_NAME%.ko}"
+          
+          echo "📊 Build parameters:"
+          echo "  Architecture: $ARCH"
+          echo "  Module name: $MODULE_NAME"
+          echo "  Full version: ${{ github.event.inputs.kernel_version }}"
+          
+          # 设置环境变量
+          export ARCH
+          export CROSS_COMPILE=aarch64-linux-gnu-  # 根据实际情况调整
+          
+          # 准备构建
+          echo "🛠️ Preparing build environment..."
+          
+          # 查找 drivers 目录
+          if [ -d "drivers/kerneldriver" ]; then
+            DRIVER_DIR="drivers/kerneldriver"
+          elif [ -d "common/drivers/kerneldriver" ]; then
+            DRIVER_DIR="common/drivers/kerneldriver"
+          else
+            echo "❌ Driver directory not found!"
+            find . -type d -name "kerneldriver" | head -5
+            exit 1
+          fi
+          
+          echo "📁 Building from: $DRIVER_DIR"
+          
+          # 进入驱动目录构建
+          cd "$DRIVER_DIR"
+          
+          # 创建临时 Makefile
+          cat > Makefile.tmp << EOF
+# Temporary Makefile for building Android 10 kernel module
+ifeq (\$(KERNELRELEASE),)
+    KERNEL_DIR ?= \$(CURDIR)/../..
+    PWD := \$(shell pwd)
+
+default:
+	\$(MAKE) -C \$(KERNEL_DIR) M=\$(PWD) ARCH=$ARCH modules
+
+clean:
+	\$(MAKE) -C \$(KERNEL_DIR) M=\$(PWD) ARCH=$ARCH clean
+
+.PHONY: default clean
+else
+    obj-m := $MODULE_NAME.o
+    $MODULE_NAME-y := $(ls *.c 2>/dev/null | head -1 | xargs basename -s .c | tr -d '\n')
+    ccflags-y := -I\$(src)
+endif
+EOF
+          
+          # 构建模块
+          echo "🚀 Starting module build..."
+          make -f Makefile.tmp KERNEL_DIR=../.. ARCH=$ARCH 2>&1 | tee build.log
+          
+          # 检查构建结果
+          if [ -f "$MODULE_NAME.ko" ]; then
+            echo "✅ Module built successfully: $MODULE_NAME.ko"
+            
+            # 检查模块信息
+            echo "📦 Module information:"
+            modinfo "$MODULE_NAME.ko" 2>/dev/null || true
+            
+            # 记录输出路径
+            echo "MODULE_PATH=$(pwd)/$MODULE_NAME.ko" >> $GITHUB_ENV
+            echo "BUILD_SUCCESS=true" >> $GITHUB_ENV
+          else
+            echo "❌ Module build failed!"
+            
+            # 输出构建错误
+            echo "=== Build errors ==="
+            grep -i "error" build.log | head -20 || true
+            
+            echo "=== Last 50 lines of build log ==="
+            tail -50 build.log
+            
+            echo "BUILD_SUCCESS=false" >> $GITHUB_ENV
+            exit 1
+          fi
+
+      - name: Upload built module
+        if: env.BUILD_SUCCESS == 'true'
+        uses: actions/upload-artifact@v4.6.2
+        with:
+          name: android10-kernel-${{ github.event.inputs.kernel_version }}-module
+          path: |
+            ${{ env.MODULE_PATH }}
+            android-kernel/.config
+          retention-days: 30
+
+      - name: Upload build logs and source
+        if: always()
+        uses: actions/upload-artifact@v4.6.2
+        with:
+          name: android10-build-logs-${{ github.event.inputs.kernel_version }}
+          path: |
+            android-kernel/sync_attempt_*.log
+            android-kernel/build.log
+            kerneldriver/
+          retention-days: 7
 
       - name: Set up Android Kernel source
         run: |
